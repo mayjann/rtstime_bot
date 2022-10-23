@@ -1,3 +1,3 @@
 import scripts.diff
-import scripts.begin_info
-import scripts.end_info
+import scripts.format_time
+import scripts.mysql
