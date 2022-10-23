@@ -1,11 +1,16 @@
 from aiogram import Bot, Dispatcher, executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+import configparser
 
-API_TOKEN = ''
 
-bot = Bot(token=API_TOKEN)
+config = configparser.ConfigParser()
+config.read('config.ini', encoding='utf-8')
+
+bot = Bot(token=config.get('bot', 'API_TOKEN'))
 dp = Dispatcher(bot, storage=MemoryStorage())
 
+
+# Уведомление о запуске бота.
 async def on_startup():
     owner = 2046660433
     await bot.send_message(chat_id=owner, text="Бот запущен")
