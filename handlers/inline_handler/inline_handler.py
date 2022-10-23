@@ -2,77 +2,115 @@ from aiogram import types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher import FSMContext
+from datetime import datetime as dt
 
-from aiobot import dp, bot
+from core import dp, bot
 from keyboards import inline_keyboards
+import configparser
 import scripts
 
 
+config = configparser.ConfigParser()
+config.read('config.ini', encoding='utf-8')
+channel_id=config.get('bot', 'channel_id')
+
 storage = MemoryStorage()
-channel_id = -1001697566553
 
 
 class Form(StatesGroup):
     name = State()
     nextdst = State()
 
-# кнопка конца работы
+
+# Кнопка конца работы.
 @dp.callback_query_handler(lambda c: c.data == 'end_btn')
 async def job_end(callback_query: types.CallbackQuery, state: FSMContext):
     await bot.answer_callback_query(callback_query.id)
+
+    # Запускаем машину состояний для ожидания ввода следующего пункта визита полевого инженера.
     await Form.name.set()
-    message_to_delete = await bot.edit_message_text(
+    userid = callback_query.from_user.id
+
+    # Отправляем полевому инженеру сообщение с просьбой указать следующий пункт и помечаем его как сообщение,
+    # которое надо удалить.
+    message_to_delete_raw = await bot.edit_message_text(
         chat_id=callback_query.from_user.id,
         message_id=callback_query.message.message_id,
         reply_markup=inline_keyboards.next_kbd,
         text="Напиши следующий пункт назначения или выбери подходящий.")
-    async with state.proxy() as data:
-        data['msg_del'] = message_to_delete
+
+    # Получаем идентификатор сообщения и вносим в базу данных.
+    message_to_delete = message_to_delete_raw.message_id
+    await scripts.mysql.update_msg(userid, message_to_delete)
 
 
+# Принимаем ответ от полевого инженера.
 @dp.message_handler(state=Form.name)
 async def process_name(message: types.Message, state: FSMContext):
     next_dst = message.text
-    member = message.from_user.id
-    member_name = message.from_user.full_name
-    next_id = message.message_id - 1
-    await bot.delete_message(chat_id=member, message_id=next_id)
-    async with state.proxy() as data:
-        data['name'] = message.text
+    userid = message.from_user.id
+
+    # Вытаскиваем из базы данных идентификатор сообщения.
+    message_to_delete = scripts.mysql.get_msg(userid)
+    time_end_raw = dt.now().strftime("%H:%M")
+
+    # Удаляем предыдущее сообщение и продолжаем работу машины состояний.
+    await bot.delete_message(chat_id=userid, message_id=message_to_delete)
     await Form.next()
-    current_date, time_begin_raw, time_end_raw, dst_get = await scripts.end_info.end_info_get(member)
-    raw_minutes = await scripts.diff.minutes_make(time_begin_raw, time_end_raw)
+
+    # Вносим в базу данных время, в которое полевой инженер закончил работу.
+    await scripts.mysql.update(time_end_raw, userid)
+
+    # Вытаскиваем необходимые данные о полевом инженере из базы данных.
+    out_name, out_id, out_destination, out_time_begin, out_time_end, out_date = await scripts.mysql.output(userid, time_end_raw)
+
+    # Выполняем калькуляцию затраченного времени.
+    raw_minutes = await scripts.diff.minutes_make(out_time_begin, time_end_raw)
     minutes_round = await scripts.diff.minutes_round_make()
+
+    # Отправляем ответ полевому инженеру и уведомление в центр времени.
     await message.answer(f"""
 Информация передана первой линии.
 
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}*
+Место проведения работ: *{out_destination}*
 Следующее место назначения: *{next_dst}*
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
-    mention = "[" + member_name + "](tg://user?id=" + str(member) + ")"
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    mention = "[" + out_name + "](tg://user?id=" + str(out_id) + ")"
     await bot.send_message(
         chat_id=channel_id,
         text=f"""
-*Инженер* {mention} *закончил работы в {time_end_raw}.*
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+*Инженер* {mention} *закончил работы в {out_time_end}.*
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}.*
+Место проведения работ: *{out_destination}.*
 Следующее место назначения: *{next_dst}.*
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    
+    # Завершаем работу машины состояний.
     await state.finish()
 
 
+# Принимаем ответ от полевого инженера о том, что он отправился на обед.
 @dp.callback_query_handler(lambda c: c.data == 'eat_btn', state=Form.name)
 async def eat_begin(callback_query: types.CallbackQuery, state: FSMContext):
-    member = callback_query.from_user.id
-    member_name = callback_query.from_user.full_name
+    userid = callback_query.from_user.id
     await bot.answer_callback_query(callback_query.id)
     await Form.name.set()
-    current_date, time_begin_raw, time_end_raw, dst_get = await scripts.end_info.end_info_get(member)
-    raw_minutes = await scripts.diff.minutes_make(time_begin_raw, time_end_raw)
+    time_end_raw = dt.now().strftime("%H:%M")
+
+    # Вносим в базу данных время, в которое полевой инженер закончил работу.
+    await scripts.mysql.update(time_end_raw, userid)
+
+    # Вытаскиваем необходимые данные о полевом инженере из базы данных.
+    out_name, out_id, out_destination, out_time_begin, out_time_end, out_date = await scripts.mysql.output(userid, time_end_raw)
+
+    # Выполняем калькуляцию затраченного времени.
+    raw_minutes = await scripts.diff.minutes_make(out_time_begin, out_time_end)
     minutes_round = await scripts.diff.minutes_round_make()
+
+    # Отправляем ответ полевому инженеру и уведомление в центр времени.
     await bot.edit_message_text(
         chat_id=callback_query.from_user.id,
         message_id=callback_query.message.message_id,
@@ -81,68 +119,96 @@ async def eat_begin(callback_query: types.CallbackQuery, state: FSMContext):
 Информация передана первой линии.
 Приятного аппетита (:
 
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}*.
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
-    mention = "[" + member_name + "](tg://user?id=" + str(member) + ")"
-
+Место проведения работ: *{out_destination}*.
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    mention = "[" + out_name + "](tg://user?id=" + str(out_id) + ")"
     await bot.send_message(
         chat_id=channel_id,
         text=f"""*
-Инженер* {mention} *закончил работы в {time_end_raw} и отправился на обед.*
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+Инженер* {mention} *закончил работы в {out_time_end} и отправился на обед.*
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}.*
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
+Место проведения работ: *{out_destination}.*
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    
+    # Завершаем работу машины состояний.
     await state.finish()
 
+
+# Получаем от полевого инженера ответ о том, что он пообедал.
 @dp.callback_query_handler(lambda c: c.data == 'eat_end_btn')
 async def eat_end(callback_query: types.CallbackQuery, state: FSMContext):
     await bot.answer_callback_query(callback_query.id)
+    userid = callback_query.from_user.id
+
+    # Запускаем машину состояний для ожидания ввода следующего пункта визита полевого инженера.
     await Form.nextdst.set()
+
+    # Отправляем полевому инженеру сообщение с просьбой указать следующий пункт и помечаем его как сообщение,
+    # которое надо удалить.
     await bot.edit_message_reply_markup(
         chat_id=callback_query.from_user.id,
         message_id=callback_query.message.message_id,
         reply_markup=None)
-    eat_message_to_delete = await bot.send_message(
+    message_to_delete_raw = await bot.send_message(
         chat_id=callback_query.from_user.id,
         reply_markup=inline_keyboards.alt_next_kbd,
         text="Напиши следующий пункт назначения или выбери подходящий.")
-    async with state.proxy() as data:
-        data['eat_msg'] = eat_message_to_delete
+    
+    # Получаем идентификатор сообщения и вносим в базу данных.
+    message_to_delete = message_to_delete_raw.message_id
+    await scripts.mysql.update_alt_msg(userid, message_to_delete)
 
 
+# Принимаем ответ от полевого инженера.
 @dp.message_handler(state=Form.nextdst)
 async def next_dst_name(message: types.Message, state: FSMContext):
-    async with state.proxy() as data:
-        eat_message_to_delete = data['eat_msg']
-    member_id = message.from_user.id
+    userid = message.from_user.id
     member_name = message.from_user.full_name
-    next_id = eat_message_to_delete.message_id
-    await bot.delete_message(chat_id=member_id, message_id=next_id)
-    async with state.proxy() as data:
-        data['nextdst'] = message.text
+    
+    # Вытаскиваем из базы данных идентификатор сообщения.
+    date_today = dt.now().strftime("%Y-%m-%d")
+    message_to_delete = scripts.mysql.get_alt_msg(userid, date_today)
+
+    # Удаляем предыдущее сообщение и продолжаем работу машины состояний.
+    await bot.delete_message(chat_id=userid, message_id=message_to_delete)
+    
     nextdst = message.text
+    
+    # Отправляем ответ полевому инженеру и уведомление в центр времени.
     await message.answer(f"""
 Информация передана первой линии.
 
 Следующее место назначения: {nextdst}""")
-    await state.finish()
-    mention = "[" + member_name + "](tg://user?id=" + str(member_id) + ")"
+    mention = "[" + member_name + "](tg://user?id=" + str(userid) + ")"
     bot_msg = f"*Инженер* {mention} *вкусно пообедал.*\nСледующее место назначения: *{nextdst}*."
     await bot.send_message(chat_id=channel_id, text=bot_msg, parse_mode="Markdown")
+    
+    # Завершаем работу машины состояний.
+    await state.finish()
 
 
+# Получаем от полевого инженера информацию о том, что он отправился в офис.
 @dp.callback_query_handler(lambda c: c.data == 'office_btn', state=Form.name)
 async def next_dst_office(callback_query: types.CallbackQuery, state: FSMContext):
     await bot.answer_callback_query(callback_query.id)
-    member = callback_query.from_user.id
-    member_name = callback_query.from_user.full_name
+    userid = callback_query.from_user.id
     await Form.name.set()
-    current_date, time_begin_raw, time_end_raw, dst_get = await scripts.end_info.end_info_get(member)
-    raw_minutes = await scripts.diff.minutes_make(time_begin_raw, time_end_raw)
+    time_end_raw = dt.now().strftime("%H:%M")
+    
+    # Вносим в базу данных время, в которое полевой инженер закончил работу.
+    await scripts.mysql.update(time_end_raw, userid)
+    
+    # Вытаскиваем необходимые данные о полевом инженере из базы данных.
+    out_name, out_id, out_destination, out_time_begin, out_time_end, out_date = await scripts.mysql.output(userid, time_end_raw)
+    
+    # Выполняем калькуляцию затраченного времени.
+    raw_minutes = await scripts.diff.minutes_make(out_time_begin, time_end_raw)
     minutes_round = await scripts.diff.minutes_round_make()
+    
+    # Отправляем ответ полевому инженеру и уведомление в центр времени.
     await bot.edit_message_text(
         chat_id=callback_query.from_user.id,
         message_id=callback_query.message.message_id,
@@ -150,29 +216,33 @@ async def next_dst_office(callback_query: types.CallbackQuery, state: FSMContext
         text=f"""
 Информация передана первой линии.
 
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}*.
+Место проведения работ: *{out_destination}*.
 Следующее место назначения: *офис*.
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
-    mention = "[" + member_name + "](tg://user?id=" + str(member) + ")"
-
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    mention = "[" + out_name + "](tg://user?id=" + str(out_id) + ")"
     await bot.send_message(
         chat_id=channel_id,
         text=f"""*
-Инженер* {mention} *закончил работы в {time_end_raw} и отправился в офис.*
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+Инженер* {mention} *закончил работы в {out_time_end} и отправился в офис.*
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}*
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
+Место проведения работ: *{out_destination}*
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    
+    # Завершаем работу машины состояний.
     await state.finish()
 
 
+# Получаем от полевого инженера информацию о том, что он отправился в офис после обеда.
 @dp.callback_query_handler(lambda c: c.data == 'office_btn', state=Form.nextdst)
 async def process_callback_office_btn(callback_query: types.CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
     member_name = callback_query.from_user.full_name
     member_id = callback_query.from_user.id
-    await bot.answer_callback_query(callback_query.id)
+    
+    # Отправляем ответ полевому инженеру и уведомление в центр времени.
     await bot.edit_message_text(
         chat_id=callback_query.from_user.id,
         message_id=callback_query.message.message_id,
@@ -182,25 +252,36 @@ async def process_callback_office_btn(callback_query: types.CallbackQuery, state
 
 Следующее место назначения: *офис*.""", parse_mode="Markdown")
     mention = "["+member_name+"](tg://user?id="+str(member_id)+")"
-
     await bot.send_message(
         chat_id=channel_id,
         text=f"""*
 Инженер* {mention} *вкусно пообедал.*
 Следующее место назначения: *Офис.*""", parse_mode="Markdown")
+    
+    # Завершаем работу машины состояний.
     await state.finish()
 
 
+# Получаем от полевого инженера информацию о том, что он отправился домой.
 @dp.callback_query_handler(lambda c: c.data == 'home_btn', state=Form.name)
 async def next_dst_home(callback_query: types.CallbackQuery, state: FSMContext):
-    member_name = callback_query.from_user.full_name
-    member_first_name = callback_query.from_user.first_name
-    member = callback_query.from_user.id
     await bot.answer_callback_query(callback_query.id)
+    member_first_name = callback_query.from_user.first_name
+    userid = callback_query.from_user.id
     await Form.name.set()
-    current_date, time_begin_raw, time_end_raw, dst_get = await scripts.end_info.end_info_get(member)
-    raw_minutes = await scripts.diff.minutes_make(time_begin_raw, time_end_raw)
+    time_end_raw = dt.now().strftime("%H:%M")
+    
+    # Вносим в базу данных время, в которое полевой инженер закончил работу.
+    await scripts.mysql.update(time_end_raw, userid)
+    
+    # Вытаскиваем необходимые данные о полевом инженере из базы данных.
+    out_name, out_id, out_destination, out_time_begin, out_time_end, out_date = await scripts.mysql.output(userid, time_end_raw)
+    
+    # Выполняем калькуляцию затраченного времени.
+    raw_minutes = await scripts.diff.minutes_make(out_time_begin, time_end_raw)
     minutes_round = await scripts.diff.minutes_round_make()
+    
+    # Отправляем ответ полевому инженеру и уведомление в центр времени.
     await bot.edit_message_text(
         chat_id=callback_query.from_user.id,
         message_id=callback_query.message.message_id,
@@ -208,18 +289,19 @@ async def next_dst_home(callback_query: types.CallbackQuery, state: FSMContext):
         text=f"""
 Информация передана первой линии. Хорошего вечера, {member_first_name}!
 
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}*.
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
-    mention = "[" + member_name + "](tg://user?id=" + str(member) + ")"
-
+Место проведения работ: *{out_destination}*.
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    mention = "[" + out_name + "](tg://user?id=" + str(out_id) + ")"
     await bot.send_message(
         chat_id=channel_id,
         text=f"""*
-Инженер* {mention} *закончил работы в {time_end_raw} и отправился домой.*
-Шаблон времени для ЛУРВ: *{time_begin_raw} {time_end_raw} {minutes_round}*.
+Инженер* {mention} *закончил работы в {out_time_end} и отправился домой.*
+Шаблон времени для ЛУРВ: *{out_time_begin} {out_time_end} {minutes_round}*.
 Без округления: *{raw_minutes}* минут.
-Место проведения работ: *{dst_get}*
-Дата проведения работ: *{current_date}*""", parse_mode="Markdown")
+Место проведения работ: *{out_destination}*
+Дата проведения работ: *{out_date}*""", parse_mode="Markdown")
+    
+    # Завершаем работу машины состояний.
     await state.finish()
